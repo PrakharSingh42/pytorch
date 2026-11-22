@@ -19,6 +19,7 @@ handled during symbolic execution, either by executing them directly when safe
 or by creating appropriate graph nodes when needed.
 """
 
+import _string  # pyrefly: ignore [missing-import]
 import abc
 import ast
 import builtins
@@ -74,6 +75,7 @@ from ..utils import (
     check_unspec_python_args,
     dict_methods,
     extract_fake_example_value,
+    get_type_mro_no_user_code,
     has_torch_function,
     is_safe_constant,
     is_torch_class,
@@ -98,7 +100,7 @@ from .base import (
     ValueMutationNew,
     VariableTracker,
 )
-from .constant import ConstantVariable
+from .constant import ConstantVariable, FakeIdVariable
 from .dicts import (
     ConstDictVariable,
     DictItemsVariable,
@@ -126,6 +128,7 @@ from .object_protocol import (
     generic_size,
     generic_str,
     maybe_get_python_type,
+    mro_attr_source,
     mro_lookup,
     object_generic_setattr,
     Py_TPFLAGS_HEAPTYPE,
@@ -880,6 +883,8 @@ class BuiltinVariable(TypeVariable):
     @functools.cache
     def _constant_fold_functions() -> set[Callable[..., Any]]:
         fns: set[Callable[..., Any]] = {
+            _string.formatter_parser,
+            _string.formatter_field_name_split,
             abs,
             all,
             any,
@@ -1535,6 +1540,9 @@ class BuiltinVariable(TypeVariable):
                 return inner_handler(tx, args, kwargs)
 
             return lazy_constant_handler
+
+        if fn is format or fn is str.format:
+            handlers.append(obj._format_user_defined)
 
         if inspect.isclass(fn) and (
             issubclass(fn, BaseException)
@@ -2223,6 +2231,11 @@ class BuiltinVariable(TypeVariable):
             # CPython (returns NotImplemented rather than falling back to the
             # reflected operation when the operands are incompatible).
             lval = args[0].as_python_constant()
+            if self.fn is object and name == "__eq__":
+                same = vt_identity_compare(args[0], args[1])
+                if same is not None:
+                    result = same.as_python_constant() or NotImplemented
+                    return ConstantVariable.create(result)
             if isinstance(lval, self.fn):
                 return ConstantVariable.create(
                     getattr(self.fn, name)(lval, args[1].as_python_constant())
@@ -3383,13 +3396,110 @@ class BuiltinVariable(TypeVariable):
     ) -> VariableTracker:
         return pynumber_invert(tx, a)
 
+    def _format_user_defined(
+        self,
+        tx: "InstructionTranslatorBase",
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker | None:
+        value = args[0] if args else None
+        effects = tx.output.side_effects
+        writes = effects.store_attr_mutations
+        expanding = tx.f_code is polyfills.builtins._expand_format.__code__
+        slots = {"__format__", "__str__", "__float__"}
+
+        def defer(field):
+            field = field.realize()
+            if isinstance(field, UserDefinedObjectVariable):
+                if writes and any(
+                    cls in effects and slots.intersection(writes.get(effects[cls], ()))
+                    for cls in get_type_mro_no_user_code(field.python_type())
+                ):
+                    unsupported(field, True)
+                return ConstantVariable.create(False)
+            if isinstance(field, FakeIdVariable):
+                field.guard_as_python_constant()
+            return ConstantVariable.create(True)
+
+        def unsupported(value, mutated):
+            unimplemented(
+                gb_type="Unsupported user-defined formatting",
+                context=f"{value.python_type_name()}.__format__, pending class mutation: {mutated}",
+                explanation="Dynamo cannot safely specialize this object's formatting behavior.",
+                hints=["Format this value outside the compiled region."],
+            )
+
+        if self.fn is str.format:
+            if expanding or value is None or value.python_type() is not str:
+                return None
+            if any(
+                isinstance(v, UserDefinedObjectVariable) and v.is_python_constant()
+                for v in itertools.chain(args[1:], kwargs.values())
+            ) or any(
+                isinstance(cls, variables.UserDefinedClassVariable)
+                and slots.intersection(attrs)
+                for cls, attrs in writes.items()
+            ):
+                from .builder import SourcelessBuilder
+
+                build = SourcelessBuilder.create_internal_user_function
+                fn = build(polyfills.builtins.str_format)
+                fields = [variables.LambdaVariable(defer), *args]
+                return fn.call_function(tx, fields, kwargs)
+            return None
+        if value is None or kwargs or len(args) not in (1, 2):
+            return None
+        spec = args[1] if len(args) == 2 else ConstantVariable.create("")
+        defer(value)  # validate mutations and identity-dependent hashes before folding
+        if isinstance(value, UserDefinedObjectVariable):
+            if spec.python_type() is not str:
+                return None
+            cls_type = value.python_type()
+            lookup = value.lookup_class_mro_attr
+            formatter = lookup("__format__")
+            if isinstance(formatter, types.FunctionType):
+                return value.SLOT1(tx, "__format__", spec)
+            if value.is_python_constant():
+                for base in (int, float, str, object):
+                    if formatter is not base.__format__ or value.cls_source is None:
+                        continue
+                    text = spec.guard_as_python_constant()
+                    names = ["__format__"]
+                    if not text:
+                        names.append("__str__")
+                    elif base is int and text[-1] in "eEfFgG%":
+                        # Floating-point presentations call PyNumber_Float on the integer.
+                        names.append("__float__")
+                    for name in names:
+                        source = mro_attr_source(tx, cls_type, value.cls_source, name)
+                        if source is None:
+                            break
+                        install_guard(source.make_guard(GuardBuilder.FUNCTION_MATCH))
+                        if name == "__str__":
+                            impl = lookup(name)
+                            if impl is base.__repr__ or impl is str.__str__:
+                                continue
+                            native = torch._C._dynamo.utils.is_instancemethod
+                            if base is not object or not native(impl):
+                                return generic_str(tx, value)
+                        if name == "__float__" and lookup(name) is not int.__float__:
+                            break
+                    else:
+                        return None  # use the ordinary constant-fold handler
+                unsupported(value, False)
+        if expanding:
+            return StringFormatVariable.create(tx, "{0:{1}}", [value, spec], {})
+        return None
+
     def call_format(
         self,
         tx: "InstructionTranslatorBase",
         _format_string: VariableTracker,
         *args: VariableTracker,
         **kwargs: VariableTracker,
-    ) -> VariableTracker:
+    ) -> VariableTracker | None:
+        if self.fn is format:
+            return None
         format_string = _format_string.as_python_constant()
         format_string = str(format_string)
         return StringFormatVariable.create(tx, format_string, list(args), kwargs)
@@ -3778,6 +3888,8 @@ class DictBuiltinVariable(TypeVariable):
         resolved_fn = getattr(dict, name, None)
         if resolved_fn is not None and resolved_fn in dict_methods:
             obj = args[0].realize()
+            if isinstance(obj, ConstDictVariable):
+                obj.check_base_dict_mutation(tx, name)
             if name == "__repr__":
                 if not isinstance(obj, ConstDictVariable):
                     unimplemented(
