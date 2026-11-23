@@ -1426,6 +1426,7 @@ for warning in w:
             x.repeat_interleave(repeats, dim=-1, output_size=4),
         )
 
+    @skipIfTorchDynamo("equal returns a data-dependent bool")
     @skipIfTorchVersionLessThan(2, 10)
     @parametrize(
         "target",
@@ -1444,6 +1445,7 @@ for warning in w:
         self.assertTrue(equal(x, x.clone()))
         self.assertFalse(equal(x, x + 1))
 
+    @skipIfTorchDynamo("nonzero has a data-dependent output shape")
     @skipIfTorchVersionLessThan(2, 10)
     @parametrize(
         "target",
