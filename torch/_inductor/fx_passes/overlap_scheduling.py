@@ -23,6 +23,10 @@ from torch._inductor.fx_passes.bucketing import (
     get_full_bucket_key,
     is_wait_tensor,
 )
+from torch._inductor.fx_passes.control_dependencies import (
+    is_ordering_alias,
+    preserve_mutation_ordering,
+)
 from torch._inductor.fx_passes.memory_estimator import MemoryTracker
 from torch._inductor.fx_passes.utils import BitsetAncestors
 from torch._logging import trace_structured
@@ -195,7 +199,7 @@ def estimate_roofline_runtime_ms(node: fx.Node) -> float:
     from torch.utils._pytree import tree_flatten, tree_map
     from torch.utils._runtime_estimation import get_compute_time, get_transfer_time
 
-    if is_view_node(node):
+    if is_view_node(node) or is_ordering_alias(node):
         return 0.0
 
     def _get_val(n: Any) -> Any:
@@ -426,9 +430,20 @@ class OverlapScheduler:
         max_off_bucket_gb: float | None = 0.5,
         prioritize_bucketing_during_scheduling: bool = True,
         pge_profile_path: str | None = None,
+        prioritize_fusion_regions: bool = False,
     ):
+        from torch._inductor.fx_passes.fusion_regions import contiguous_fusion_regions
+
         self.gm = gm
         self.graph = gm.graph
+        if not preserve_mutation_ordering(gm):
+            raise RuntimeError(
+                "OverlapScheduler requires storage metadata for mutation ordering"
+            )
+        self.prioritize_fusion_regions = prioritize_fusion_regions
+        self.last_scheduled_node: fx.Node | None = None
+        self._fusion_pending_region: OrderedSet[fx.Node] | None = None
+        self._fusion_pending: OrderedSet[fx.Node] = OrderedSet()
         self.compute_overlap_multipler = compute_overlap_multipler
         self.max_node_distance = max_coll_distance
         self.max_in_flight_bytes: int = gb_to_bytes(max_in_flight_gb)
@@ -480,6 +495,15 @@ class OverlapScheduler:
         # Compute initial node runtime estimates. Compute nodes use roofline model
         # here; the alignment step in run() replaces them with benchmarked +
         # cross-rank-aligned values.
+        self.fusion_region_of = (
+            {
+                node: region
+                for region in contiguous_fusion_regions(gm)
+                for node in region
+            }
+            if prioritize_fusion_regions
+            else {}
+        )
         self.node_estimations = gather_node_runtime_estimations(
             gm,
             custom_runtime_estimation,
@@ -563,6 +587,16 @@ class OverlapScheduler:
         )
         self.reduce_scatter_domination = self._calculate_domination_index(
             self.reduce_scatter_nodes
+        )
+
+        compute_nodes = OrderedSet(self.compute_nodes)
+        self._memory_pressure_nodes = OrderedSet(
+            node
+            for node in self.nodes
+            if node.op != "output"
+            and node not in self.collective_info
+            and not _schedulable_wait_node(node)
+            and (self.off_compute_path(node) or node not in compute_nodes)
         )
 
         self.in_degree = Counter(user for node in self.nodes for user in node.users)
@@ -922,6 +956,94 @@ class OverlapScheduler:
 
         log.info("Overlap scheduling: Runtime estimations aligned")
 
+    def _get_memory_pressure_node(self) -> fx.Node | None:
+        if self.memory_tracker is None or not self.on_path_ready:
+            return None
+        _, preferred = self.on_path_ready[0]
+        if preferred in self.scheduled:
+            return None
+        peak = self.memory_tracker.estimate_node_peak_memory(preferred)
+        if peak <= self.allowed_peak_memory_bytes:
+            return None
+
+        current = self.memory_tracker.current_memory_bytes
+        limit = max(current, self.allowed_peak_memory_bytes)
+        headroom = limit - current
+        candidates = []
+        queues = (self.off_path_ready, self.on_path_ready)
+        for queue_index, queue in enumerate(queues):
+            for index, (_, node) in enumerate(queue):
+                allocated = None
+                if node.op in ("placeholder", "get_attr", "output"):
+                    allocated = 0
+                elif (
+                    self.memory_tracker.device_filter
+                    is self.memory_tracker._default_device_filter
+                ):
+                    allocated = self.memory_tracker._concrete_allocation_bytes.get(node)
+                if allocated is not None and allocated > headroom:
+                    continue
+                if node in self.scheduled or node not in self._memory_pressure_nodes:
+                    continue
+                if (
+                    allocated is None
+                    and self.memory_tracker.estimate_node_peak_memory(node) > limit
+                ):
+                    continue
+                peak, after = self.memory_tracker.estimate_node_memory(node)
+                if peak <= limit:
+                    candidates.append(
+                        (
+                            after >= current,
+                            self.node_idx[node],
+                            queue_index,
+                            index,
+                            node,
+                        )
+                    )
+        if not candidates:
+            return None
+        _, _, queue_index, index, node = min(candidates)
+        queue = queues[queue_index]
+        queue.pop(index)
+        heapq.heapify(queue)
+        return node
+
+    def _get_fusion_continuation(self) -> fx.Node | None:
+        if not self.prioritize_fusion_regions or self.last_scheduled_node is None:
+            return None
+        regions = self.fusion_region_of
+        region = regions.get(self.last_scheduled_node)
+        if region is None:
+            return None
+        if self._fusion_pending_region is not region:
+            self._fusion_pending_region = region
+            self._fusion_pending = OrderedSet(
+                sorted(
+                    (node for node in region if node not in self.scheduled),
+                    key=self.node_idx.__getitem__,
+                )
+            )
+        for node in self._fusion_pending:
+            if (
+                node not in self.scheduled
+                and self.in_degree[node] == 0
+                and (
+                    not is_compute_node(node)
+                    or self.compute_index_domination[node] == self.current_compute_index
+                )
+                and (
+                    self.memory_tracker is None
+                    or self.memory_tracker.estimate_node_peak_memory(node)
+                    <= max(
+                        self.allowed_peak_memory_bytes,
+                        self.memory_tracker.current_memory_bytes,
+                    )
+                )
+            ):
+                return node
+        return None
+
     def _get_next_nodes(self) -> list[fx.Node]:
         """
         Get next node(s) to schedule.
@@ -930,6 +1052,18 @@ class OverlapScheduler:
         (same bucket_key) are batched together to enable bucketing them in
         overlap_preserving_bucketer. Bucket size is limited by max_off_bucket_bytes.
         """
+        for queue in (self.on_path_ready, self.off_path_ready):
+            while queue and queue[0][1] in self.scheduled:
+                heapq.heappop(queue)
+        if not self.on_path_ready and not self.off_path_ready:
+            return []
+        pressure_node = self._get_memory_pressure_node()
+        if pressure_node is not None:
+            return [pressure_node]
+
+        continuation = self._get_fusion_continuation()
+        if continuation is not None:
+            return [continuation]
         if self.off_path_ready:
             _, node = self.off_path_ready[0]
 
@@ -1147,6 +1281,8 @@ class OverlapScheduler:
         if not all(n in self.scheduled for n in node.all_input_nodes):
             raise AssertionError(f"node {node} has unscheduled input nodes")
         self.scheduled.add(node)
+        self._fusion_pending.discard(node)
+        self.last_scheduled_node = node
         self._scheduled_bits |= self.node_ancestors.node_bit(node)
         if self.memory_tracker is not None:
             self.memory_tracker.schedule_node(node)
@@ -1785,6 +1921,7 @@ def gather_node_runtime_estimations(
             fused_costs = estimate_fused_node_costs(raw_regions)
 
     estimations: dict[fx.Node, float] = {}
+    custom_estimated_nodes: OrderedSet[fx.Node] = OrderedSet()
     nodes = list(gm.graph.nodes)
 
     # Collectives
@@ -1810,11 +1947,16 @@ def gather_node_runtime_estimations(
 
     for node in nodes:
         if is_compute_node(node):
-            est = estimate_roofline_runtime_ms(node)
+            est = (
+                fused_costs[node]
+                if node in fused_costs
+                else estimate_roofline_runtime_ms(node)
+            )
             if custom_runtime_estimation is not None:
                 custom_est = custom_runtime_estimation(node, None)
                 if custom_est is not None:
                     est = custom_est
+                    custom_estimated_nodes.add(node)
             estimations[node] = est
             compute_nodes.append(node)
             compute_analytical.append(est)
@@ -1823,13 +1965,18 @@ def gather_node_runtime_estimations(
                 est = custom_runtime_estimation(node, None)
                 if est is not None:
                     estimations[node] = est
+                    custom_estimated_nodes.add(node)
             else:
                 est = estimate_roofline_runtime_ms(node)
                 if est > 0:
                     estimations[node] = est
 
     # Apply fused costs: replace individual I/O estimates with fusion-aware ones
-    estimations.update(fused_costs)
+    estimations.update(
+        (node, cost)
+        for node, cost in fused_costs.items()
+        if node not in custom_estimated_nodes
+    )
 
     # Logging
     if log_estimations and compute_nodes:
@@ -1915,6 +2062,7 @@ def schedule_overlap_bucketing(
     pge_profile_path: str | None = None,
     pre_bucketing_fsdp_collectives: bool = True,
     pre_bucketing_fsdp_collectives_bucket_cap_mb: float | None = None,
+    prioritize_fusion_regions: bool = False,
 ) -> torch.fx.GraphModule:
     """Schedule nodes to maximize compute-collective overlap.
 
@@ -1951,6 +2099,13 @@ def schedule_overlap_bucketing(
         op="call_function",
         target=torch.ops._c10d_functional.wait_tensor.default,
     ):
+        return gm
+
+    if not preserve_mutation_ordering(gm):
+        log.warning(
+            "Skipping overlap scheduling: storage metadata for mutation ordering "
+            "is unavailable"
+        )
         return gm
 
     if pre_bucketing_fsdp_collectives:
@@ -1991,6 +2146,7 @@ def schedule_overlap_bucketing(
         max_off_bucket_gb=max_off_bucket_gb,
         bucket_mode=bucket_mode,
         pge_profile_path=pge_profile_path,
+        prioritize_fusion_regions=prioritize_fusion_regions,
     ).run()
     trace_structured(
         "artifact",
@@ -2040,6 +2196,7 @@ def schedule_overlap_bucketing_from_inductor_configs(
         "bucket_exposed_first",
         "bucket_only_internode_comms",
         "enable_fusion_regions",
+        "prioritize_fusion_regions",
         "prioritize_bucketing_during_scheduling",
         "bucket_mode",
         "pre_bucketing_fsdp_collectives",

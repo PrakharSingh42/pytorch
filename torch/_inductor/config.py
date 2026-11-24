@@ -1602,6 +1602,7 @@ class aten_distributed_optimizations:
     # When enabled, groups of fusible ops (pointwise, reduction, etc.) have their
     # I/O costs corrected to exclude intermediates that inductor will not materialize.
     enable_fusion_regions: bool = True
+    prioritize_fusion_regions: bool = False
 
     # Default bucketing mode for auto and manual overlap scheduling
     # "default": traced bucketing, fully lowered by inductor during compilation

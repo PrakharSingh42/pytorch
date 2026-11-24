@@ -207,9 +207,16 @@ def _get_collective_node_from_wait(node: torch.fx.Node) -> torch.fx.Node | None:
     """
     if not is_wait_tensor(node):
         return None
+    from torch._inductor.fx_passes.control_dependencies import is_ordering_alias
+
     arg = node.args[0]
     if not isinstance(arg, torch.fx.Node):
         raise AssertionError(f"expected arg to be a Node, got {type(arg)}")
+    while is_ordering_alias(arg):
+        source = arg.args[2]
+        if not isinstance(source, torch.fx.Node):
+            return None
+        arg = source
     if arg.op != "call_function":
         return None
     if arg.target is operator.getitem:

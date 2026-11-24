@@ -1,7 +1,8 @@
+import copy
 import itertools
 import logging
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import torch
@@ -336,19 +337,27 @@ class MemoryTracker:
 
         Args:
             graph: FX graph to track memory for under alternative scheduling
-            is_releasable: do we consider this input to the graph to release memory
-            upon final use, or is allocated for the duration of the graph ?
-            by default, we assume all nodes but those that start with "primals" to be releasable
+            is_releasable: Whether an allocator's storage can be released at final use.
+            Default: allocators whose names do not start with "primals".
             device_filter: Function to determine which devices to track (default: non-CPU)
         """
 
         self.graph = graph
         self.nodes = list(graph.nodes)
         self.device_filter = device_filter or (lambda device: device.type != "cpu")
+        self._default_device_filter = (
+            self.device_filter if device_filter is None else None
+        )
         self.scheduled: OrderedSet[fx.Node] = OrderedSet()
 
         # Memory tracking using GraphAliasTracker
         self.alias_tracker = GraphAliasTracker(self.nodes)
+        self._remaining_uses = {
+            storage: len(uses)
+            for storage, uses in self.alias_tracker.storage_to_uses.items()
+        }
+        self._no_last_use_input_storages: dict[fx.Node, tuple[StorageKey, ...]] = {}
+        self._concrete_allocation_bytes = self._compute_concrete_allocation_bytes()
         self.current_live_storages: OrderedSet[StorageKey] = OrderedSet()
         self.current_memory_bytes = 0
         self.is_releasable = _is_releasable if is_releasable is None else is_releasable
@@ -363,6 +372,7 @@ class MemoryTracker:
                         self.current_memory_bytes += self._get_storage_size(storage_key)
 
         self.peak_memory = self.current_memory_bytes
+        self.last_node_peak_memory = self.current_memory_bytes
 
         log.debug(
             "Memory tracker initialized with initial memory: %d MB",
@@ -379,20 +389,102 @@ class MemoryTracker:
         if node in self.scheduled:
             raise AssertionError("should not schedule node twice")
         self.scheduled.add(node)
+        self._no_last_use_input_storages.pop(node, None)
+        for storage in self.alias_tracker.get_storage_uses(node):
+            self._remaining_uses[storage] -= 1
+            if self._no_last_use_input_storages and self._remaining_uses[storage] == 1:
+                for user in self.alias_tracker.storage_to_uses[storage]:
+                    self._no_last_use_input_storages.pop(user, None)
+        self.last_node_peak_memory = self.current_memory_bytes
         self._update_memory_for_node(node)
 
     def get_current_memory_bytes(self) -> int:
         """Get current live memory in bytes under the current scheduling."""
         return self.current_memory_bytes
 
+    def estimate_peak_memory(self, nodes: Iterable[fx.Node]) -> int:
+        """Estimate the transient peak of a future schedule without changing state."""
+        preview = copy.copy(self)
+        preview.scheduled = self.scheduled.copy()
+        preview.current_live_storages = self.current_live_storages.copy()
+        preview._remaining_uses = self._remaining_uses.copy()
+        preview._no_last_use_input_storages = {}
+        peak = self.current_memory_bytes
+        for node in nodes:
+            if node not in preview.scheduled:
+                preview.schedule_node(node)
+                peak = max(peak, preview.last_node_peak_memory)
+        return peak
+
+    def estimate_node_peak_memory(self, node: fx.Node) -> int:
+        """Estimate a node's allocation-before-release peak."""
+        if node.op in ("placeholder", "get_attr", "output"):
+            return self.current_memory_bytes
+        if (
+            self.device_filter is self._default_device_filter
+            and node not in self.scheduled
+            and node in self._concrete_allocation_bytes
+        ):
+            return self.current_memory_bytes + self._concrete_allocation_bytes[node]
+        allocated = sum(
+            self._get_storage_size(storage)
+            for storage in self.alias_tracker.get_fresh_allocations(node)
+            if self.device_filter(storage.device)
+            and storage not in self.current_live_storages
+        )
+        return self.current_memory_bytes + allocated
+
+    def _compute_concrete_allocation_bytes(self) -> dict[fx.Node, int]:
+        if self.device_filter is not self._default_device_filter:
+            return {}
+        allocations: dict[fx.Node, int] = {}
+        for node in self.nodes:
+            total = 0
+            for storage in self.alias_tracker.get_fresh_allocations(node):
+                if not self.device_filter(storage.device):
+                    continue
+                size = storage.storage.nbytes()
+                if not isinstance(size, int):
+                    break
+                total += size
+            else:
+                allocations[node] = total
+        return allocations
+
+    def estimate_node_memory(self, node: fx.Node) -> tuple[int, int]:
+        """Estimate a node's transient peak and live bytes after its last-use releases."""
+        peak = self.estimate_node_peak_memory(node)
+        if node.op in ("placeholder", "get_attr", "output"):
+            return peak, peak
+        freed = sum(
+            self._get_storage_size(storage)
+            for storage in self._get_storages_freed_by_node(node)
+        )
+        return peak, peak - freed
+
     def _get_storage_size(self, storage_key: StorageKey) -> int:
         """Get the size of a storage in bytes, handling symbolic shapes."""
         size_bytes = storage_key.storage.nbytes()
         return optimization_hint(size_bytes)
 
-    def _get_storages_freed_by_node(self, node: fx.Node) -> OrderedSet[StorageKey]:
+    def _get_storages_freed_by_node(self, node: fx.Node) -> list[StorageKey]:
         """Get storages that would be freed if we schedule this node."""
-        freed_storages: OrderedSet[StorageKey] = OrderedSet()
+        cacheable = (
+            self.device_filter is self._default_device_filter
+            and self.is_releasable is _is_releasable
+            and node not in self.scheduled
+        )
+        cached = self._no_last_use_input_storages.get(node) if cacheable else None
+        if cached is not None:
+            for storage in cached:
+                if storage not in self.current_live_storages:
+                    raise AssertionError(
+                        "all input storages should be currently allocated"
+                    )
+            return []
+        freed_storages: list[StorageKey] = []
+        tracked: list[StorageKey] = []
+        has_last_use = False
 
         input_storages = self.alias_tracker.get_storage_uses(node)
         for storage_key in input_storages:
@@ -403,17 +495,20 @@ class MemoryTracker:
             if storage_key not in self.current_live_storages:
                 raise AssertionError("all input storages should be currently allocated")
 
-            if not self.is_releasable(
-                self.alias_tracker.storage_to_allocator[storage_key]
+            if cacheable:
+                tracked.append(storage_key)
+
+            if self._remaining_uses[storage_key] != (
+                0 if node in self.scheduled else 1
             ):
                 continue
 
-            all_uses = self.alias_tracker.storage_to_uses[storage_key]
+            has_last_use = True
+            if self.is_releasable(self.alias_tracker.storage_to_allocator[storage_key]):
+                freed_storages.append(storage_key)
 
-            # If no more unscheduled uses remain, the storage can be freed
-            if all(u in self.scheduled for u in all_uses):
-                freed_storages.add(storage_key)
-
+        if cacheable and not has_last_use:
+            self._no_last_use_input_storages[node] = tuple(tracked)
         return freed_storages
 
     def _update_memory_for_node(self, node: fx.Node) -> None:
@@ -434,6 +529,7 @@ class MemoryTracker:
                 self.current_memory_bytes += size
                 alloc_bytes += size
 
+        self.last_node_peak_memory = self.current_memory_bytes
         self.peak_memory = max(self.current_memory_bytes, self.peak_memory)
 
         # Remove storages that are no longer used

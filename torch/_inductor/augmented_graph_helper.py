@@ -1,5 +1,6 @@
 import logging
 from collections import defaultdict
+from collections.abc import Iterator
 
 import torch
 import torch.fx as fx
@@ -97,6 +98,11 @@ class AugmentedGraphHelper:
 
         return deps
 
+    def _iter_merged_deps(self, node: fx.Node) -> Iterator[fx.Node]:
+        for merged_node in self.merge_sets[node]:
+            yield from merged_node.all_input_nodes
+            yield from self.extra_deps.get(merged_node, ())
+
     def has_cycle(self) -> bool:
         return torch._dynamo.graph_deduplication._has_cycle(
             self.graph, self.get_all_extra_deps()
@@ -118,7 +124,8 @@ class AugmentedGraphHelper:
     def has_path(self, source: fx.Node, target: fx.Node) -> bool:
         """Check if there's a path from source to target."""
         # we should not be checking path from node to itself
-        if self.merge_sets[source] is self.merge_sets[target]:
+        source_set = self.merge_sets[source]
+        if source_set is self.merge_sets[target]:
             raise AssertionError("source and target must not be in the same merge set")
 
         # search backwards from target to source
@@ -129,9 +136,9 @@ class AugmentedGraphHelper:
         while queue:
             current = queue.pop()
 
-            for dep in self.get_merged_deps(current):
+            for dep in self._iter_merged_deps(current):
                 # Check if we reached source or its equivalent
-                if dep in self.merge_sets[source]:
+                if dep in source_set:
                     return True
 
                 if dep in visited:
@@ -141,7 +148,6 @@ class AugmentedGraphHelper:
                 # of target.
                 # If dep is an ancestor of source, any path through dep to source would imply a cycle
                 if self.node_ancestors:
-                    source_set = self.merge_sets[source]
                     is_ancestor_of_source = any(
                         self.node_ancestors.is_ancestor(dep, s) for s in source_set
                     )
