@@ -40,7 +40,7 @@ from functorch import (
 from functorch.experimental import functionalize, replace_all_batch_norm_modules_
 from torch._C import _ExcludeDispatchKeyGuard, DispatchKey, DispatchKeySet
 from torch._dynamo import allow_in_graph
-from torch._functorch.eager_transforms import _slice_argnums
+from torch._functorch.eager_transforms import _jvp_with_argnums, _slice_argnums
 from torch._functorch.make_functional import (
     functional_init,
     functional_init_with_buffers,
@@ -2018,6 +2018,18 @@ jacrev_and_jacfwd = parametrize(
 
 FIXME_jacrev_only = parametrize("jacapi", [subtest(jacrev, name="jacrev")])
 
+# Pairs of equivalent argnums for a function that takes three positional args
+negative_and_positive_argnums = parametrize(
+    "argnums, pos_argnums",
+    [
+        subtest((-1, 2), name="int"),
+        subtest(((-1,), (2,)), name="tuple_of_one"),
+        subtest(((0, -1), (0, 2)), name="mixed_tuple"),
+        subtest(((-1, 0), (2, 0)), name="mixed_tuple_out_of_order"),
+        subtest(((-3, -1), (0, 2)), name="negative_tuple"),
+    ],
+)
+
 
 @markDynamoStrictTest
 class TestJacDevice(VmapTearDownMixin, TestCase):
@@ -2421,6 +2433,17 @@ class TestJacDevice(VmapTearDownMixin, TestCase):
         self.assertEqual(z, expected)
 
     @jacrev_and_jacfwd
+    @negative_and_positive_argnums
+    def test_negative_vs_positive_argnums(self, device, jacapi, argnums, pos_argnums):
+        def f(x, y, z):
+            return x * y + z**2, (x * z).sin()
+
+        args = tuple(torch.randn(3, device=device) for _ in range(3))
+        expected = jacrev(f, argnums=pos_argnums)(*args)
+        self.assertEqual(jacapi(f, argnums=pos_argnums)(*args), expected)
+        self.assertEqual(jacapi(f, argnums=argnums)(*args), expected)
+
+    @jacrev_and_jacfwd
     def test_empty_argnums(self, device, jacapi):
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "must be non-empty"):
@@ -2747,6 +2770,16 @@ class TestHessianDevice(TestCase):
         y = torch.randn(3, device=device)
         self._test_against_reference(f, (x, y))
 
+    @negative_and_positive_argnums
+    def test_negative_vs_positive_argnums(self, device, argnums, pos_argnums):
+        def f(x, y, z):
+            return (x * y + z**3).sin().sum()
+
+        args = tuple(torch.randn(3, device=device) for _ in range(3))
+        expected = jacrev(jacrev(f, argnums=pos_argnums), argnums=pos_argnums)(*args)
+        self.assertEqual(hessian(f, argnums=pos_argnums)(*args), expected)
+        self.assertEqual(hessian(f, argnums=argnums)(*args), expected)
+
     # Pre-3.14 the skip is a frame handling difference; on 3.14+ the test hits
     # https://github.com/pytorch/pytorch/issues/192284. That issue disables the
     # test by its old class name, which this file's Device suffix no longer
@@ -2903,6 +2936,22 @@ class TestJvpDevice(TestCase):
         result = jvp(f, (x, y), (tx, ty))
         expected = (f(x, y), f(tx, ty))
         self.assertTrue(isinstance(result, tuple))
+        self.assertEqual(result, expected)
+
+    @negative_and_positive_argnums
+    def test_jvp_with_argnums_negative_vs_positive(self, device, argnums, pos_argnums):
+        def f(x, y, z):
+            return x * y + z**2, (x * z).sin()
+
+        primals = tuple(torch.randn(3, device=device) for _ in range(3))
+        diff_argnums = (pos_argnums,) if isinstance(pos_argnums, int) else pos_argnums
+        tangents = tuple(torch.randn(3, device=device) for _ in diff_argnums)
+        full_tangents = [torch.zeros(3, device=device) for _ in primals]
+        for i, tangent in zip(diff_argnums, tangents, strict=True):
+            full_tangents[i] = tangent
+
+        expected = jvp(f, primals, tuple(full_tangents))
+        result = _jvp_with_argnums(f, primals, tangents, argnums, has_aux=False)
         self.assertEqual(result, expected)
 
     def test_jvp_new_tensor(self):

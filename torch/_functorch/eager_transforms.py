@@ -948,6 +948,7 @@ def _check_unique_non_empty(argnums: argnums_t) -> None:
 def _replace_args(
     old_args: tuple[Any, ...], new_args: tuple[Any, ...], argnums: argnums_t
 ) -> tuple[Any, ...]:
+    argnums = _validate_and_wrap_argnums(argnums, len(old_args))
     if isinstance(argnums, int):
         if len(new_args) != 1:
             raise RuntimeError(
